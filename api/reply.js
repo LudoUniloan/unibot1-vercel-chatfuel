@@ -10,45 +10,54 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Missing user_id or message" });
     }
 
-    const systemPrompt = `
-Tu es UNIBOT, un assistant francophone clair et concret.
-Réponds en 800 caractères max quand c'est possible.
-Pose au besoin une seule question de clarification avant d'agir.
-`;
+    if (!process.env.OPENAI_API_KEY) {
+      // <- si la variable est mal nommée/absente, on le voit ici
+      return res.status(500).json({ reply: "Config manquante: OPENAI_API_KEY" });
+    }
 
-    // Appel vers OpenAI Responses API
+    const systemPrompt =
+      "Tu es UNIBOT, assistant FR clair et concret. Réponds en <= 800 caractères.";
+
+    // Modèle ultra compatible
+    const model = "gpt-4o-mini";
+
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "gpt-4.1-mini",
+        model,
         store: true,
         conversation: `wa:${user_id}`,
         input: [
           { role: "system", content: [{ type: "text", text: systemPrompt }] },
-          { role: "user", content: [{ type: "text", text: message }] }
-        ]
-      })
+          { role: "user", content: [{ type: "text", text: message }] },
+        ],
+      }),
     });
 
+    const text = await r.text(); // on lit le corps pour diagnostiquer
     if (!r.ok) {
-      const txt = await r.text();
-      console.error("OpenAI error:", txt);
-      return res.status(500).json({ reply: "Désolé, souci technique. Réessaie plus tard." });
+      // On renvoie un message d’erreur explicite côté client
+      // (ça t’évitera le “souci technique” opaque)
+      let hint = "Erreur API OpenAI";
+      try {
+        const err = JSON.parse(text);
+        hint = err?.error?.message || hint;
+      } catch {}
+      return res.status(500).json({ reply: `Erreur OpenAI (${r.status}) : ${hint}` });
     }
 
-    const data = await r.json();
+    const data = JSON.parse(text);
     const reply =
       data?.output?.[0]?.content?.[0]?.text ??
       data?.output_text ??
       "Désolé, je n’ai pas pu répondre cette fois.";
 
-    res.status(200).json({ reply });
+    return res.status(200).json({ reply, session: session || null });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ reply: "Oups, une erreur est survenue." });
+    return res.status(500).json({ reply: "Oups, une erreur est survenue." });
   }
 }
