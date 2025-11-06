@@ -1,23 +1,16 @@
 // api/reply.js
 export default async function handler(req, res) {
   try {
-    if (req.method !== "POST") {
-      return res.status(405).json({ error: "Method not allowed" });
-    }
+    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
     const { user_id, message, session, conv_id } = req.body || {};
-    if (!user_id || !message) {
-      return res.status(400).json({ error: "Missing user_id or message" });
-    }
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ reply: "Config manquante: OPENAI_API_KEY" });
-    }
+    if (!user_id || !message) return res.status(400).json({ error: "Missing user_id or message" });
+    if (!process.env.OPENAI_API_KEY) return res.status(500).json({ reply: "Config manquante: OPENAI_API_KEY" });
 
-    const systemPrompt =
-      "Tu es UNIBOT, assistant francophone clair et concret. Réponds en moins de 800 caractères. Pose une seule question si besoin.";
+    const systemPrompt = "Tu es UNIBOT, assistant francophone clair et concret. Réponds en < 800 caractères. Pose 1 question max si besoin.";
     const model = "gpt-4o-mini";
 
-    // Payload de base pour Responses API
+    // --- Construire le payload de base
     const payload = {
       model,
       store: true,
@@ -27,15 +20,17 @@ export default async function handler(req, res) {
       ],
     };
 
-    // ⚠️ On N'AJOUTE 'conversation' QUE si on a déjà un conv_id connu
-    if (conv_id) {
-      // Sanitize minimal: l'API attend un id commençant par "conv"
-      const safe = String(conv_id).replace(/[^A-Za-z0-9_-]/g, "_");
-      if (!safe.startsWith("conv")) {
-        payload.conversation = `conv_${safe}`.slice(0, 64);
-      } else {
-        payload.conversation = safe.slice(0, 64);
-      }
+    // --- N'ajouter 'conversation' QUE si conv_id est vraiment valable
+    const normalized = (conv_id ?? "").toString().trim().toLowerCase();
+    const hasValidConv =
+      normalized &&
+      normalized !== "null" &&
+      normalized !== "undefined" &&
+      normalized !== "false";
+
+    if (hasValidConv) {
+      const safe = String(conv_id).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64);
+      payload.conversation = safe.startsWith("conv") ? safe : `conv_${safe}`;
     }
 
     const r = await fetch("https://api.openai.com/v1/responses", {
@@ -48,7 +43,6 @@ export default async function handler(req, res) {
     });
 
     const text = await r.text();
-
     if (!r.ok) {
       let hint = "Erreur API OpenAI";
       try { hint = JSON.parse(text)?.error?.message || hint; } catch {}
@@ -56,11 +50,9 @@ export default async function handler(req, res) {
     }
 
     const data = JSON.parse(text);
-
-    // 🆕 Récupère l'ID de conversation retourné par OpenAI (créé ou réutilisé)
     const returnedConvId =
-      data?.conversation?.id || // format fréquent
-      data?.output?.[0]?.conversation_id || // au cas où
+      data?.conversation?.id ||
+      data?.output?.[0]?.conversation_id ||
       payload.conversation || null;
 
     const reply =
@@ -68,13 +60,8 @@ export default async function handler(req, res) {
       data?.output_text ??
       "Désolé, je n’ai pas pu répondre cette fois.";
 
-    return res.status(200).json({
-      reply,
-      conv_id: returnedConvId || null,
-      session: session || null
-    });
+    return res.status(200).json({ reply, conv_id: returnedConvId, session: session || null });
   } catch (e) {
-    console.error(e);
     return res.status(500).json({ reply: "Oups, une erreur est survenue." });
   }
 }
