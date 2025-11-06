@@ -1,4 +1,5 @@
 // api/reply.js
+
 async function callOpenAI(payload, apiKey) {
   const r = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -24,6 +25,17 @@ function pickMessage(body) {
     .trim();
 }
 
+function normalizeConvId(conv_id, user_id) {
+  if (!conv_id || typeof conv_id !== "string" || conv_id.trim() === "" || conv_id === "null")
+    return `conv_${String(user_id || "user").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40)}`;
+  // si ça ne commence pas par conv, on le reformate proprement
+  if (!conv_id.startsWith("conv")) {
+    const clean = conv_id.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 50);
+    return `conv_${clean}`;
+  }
+  return conv_id.slice(0, 64);
+}
+
 function extractConvId(data, payload) {
   return (
     data?.conversation?.id ||
@@ -36,58 +48,63 @@ function extractConvId(data, payload) {
 
 export default async function handler(req, res) {
   try {
-    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+    if (req.method !== "POST")
+      return res.status(405).json({ error: "Method not allowed" });
 
     const { user_id, session, conv_id } = req.body || {};
     const msg = pickMessage(req.body);
 
     if (!user_id || !msg) {
       return res.status(400).json({
-        reply: "Ton message semble vide. Dis-moi ce que tu veux savoir et je t’aide 🙂",
+        reply:
+          "Ton message semble vide. Dis-moi ce que tu veux savoir et je t’aide 🙂",
       });
     }
+
     if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ reply: "Config manquante: OPENAI_API_KEY" });
+      return res
+        .status(500)
+        .json({ reply: "Config manquante: OPENAI_API_KEY" });
     }
 
     const systemPrompt =
       "Tu es UNIBOT, assistant francophone clair et concret. " +
       "Ne redis pas 'Salut' si la conversation est entamée. " +
-      "Réponds directement, idéalement en < 800 caractères.";
+      "Réponds directement, en moins de 800 caractères si possible.";
 
-    // Payload de base
+    // ✅ on génère toujours un conv_id valide
+    const conversation = normalizeConvId(conv_id, user_id);
+
     const base = {
       model: "gpt-4o-mini",
       store: true,
+      conversation, // garanti valide
       input: [
         { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
-        { role: "user",   content: [{ type: "input_text", text: msg }] },
+        { role: "user", content: [{ type: "input_text", text: msg }] },
       ],
     };
 
-    // N'ajouter 'conversation' QUE si on a un conv_id non vide et non "null"/"undefined"
-    const norm = (conv_id ?? "").toString().trim().toLowerCase();
-    const hasConv = norm && norm !== "null" && norm !== "undefined";
-    const payload = hasConv
-      ? { ...base, conversation: String(conv_id).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64) }
-      : { ...base };
+    let { ok, status, text } = await callOpenAI(base, process.env.OPENAI_API_KEY);
 
-    // 1er appel
-    let { ok, status, text } = await callOpenAI(payload, process.env.OPENAI_API_KEY);
-
-    // Si l'ID fourni n'existe pas (404), on REESSAIE sans conversation (création auto)
-    if (!ok && status === 404 && payload.conversation) {
-      const payloadNoConv = { ...base }; // même message, sans conversation
-      ({ ok, status, text } = await callOpenAI(payloadNoConv, process.env.OPENAI_API_KEY));
+    if (!ok && status === 404) {
+      // recrée une conv propre
+      const retry = { ...base };
+      delete retry.conversation;
+      ({ ok, status, text } = await callOpenAI(
+        retry,
+        process.env.OPENAI_API_KEY
+      ));
     }
 
     if (!ok) {
       let hint = "Erreur API OpenAI";
-      try { hint = JSON.parse(text)?.error?.message || hint; } catch {}
-      if (status === 429) {
-        return res.status(429).json({ reply: "Beaucoup de demandes en ce moment 😅 Réessaie dans une minute." });
-      }
-      return res.status(500).json({ reply: `Erreur OpenAI (${status}) : ${hint}` });
+      try {
+        hint = JSON.parse(text)?.error?.message || hint;
+      } catch {}
+      return res.status(500).json({
+        reply: `Erreur OpenAI (${status}) : ${hint}`,
+      });
     }
 
     const data = JSON.parse(text);
@@ -96,15 +113,14 @@ export default async function handler(req, res) {
       data?.output_text ??
       "Désolé, je n’ai pas pu répondre cette fois.";
 
-    const newConv = extractConvId(data, payload);
-    const out = { reply };
-
-    // NE renvoyer conv_id que s'il est connu (pour ne pas écraser côté Chatfuel)
-    if (newConv && typeof newConv === "string" && newConv.trim()) out.conv_id = newConv;
-    if (session) out.session = session;
-
-    return res.status(200).json(out);
+    const newConv = extractConvId(data, base);
+    return res.status(200).json({
+      reply,
+      conv_id: newConv || conversation,
+      session: session || null,
+    });
   } catch (e) {
+    console.error(e);
     return res.status(500).json({ reply: "Oups, une erreur est survenue." });
   }
 }
