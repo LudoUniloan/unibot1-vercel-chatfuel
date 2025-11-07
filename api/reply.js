@@ -55,6 +55,15 @@ function checkDailyLimit(userId) {
   return { ok: true };
 }
 
+const base = {
+  store: true,
+  conversation,
+  input: [{ role: "user", content: [{ type: "input_text", text: msg }] }],
+  ...(HAS_ASSISTANT
+    ? { assistant_id: process.env.UNIBOT_ASSISTANT_ID }
+    : { model: OPENAI_MODEL }),
+};
+
 // ====== Inactivité / reset auto ======
 function idleTooLong(userId, minutes = IDLE_RESET_MIN) {
   const now = Date.now();
