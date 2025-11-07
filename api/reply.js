@@ -1,5 +1,58 @@
 // api/reply.js
 
+// ========== Daily rate-limit (par utilisateur) ==========
+// Compteur en mémoire (reset à minuit UTC)
+const DAILY = new Map(); // user_id -> { day: 'YYYY-MM-DD', count: number }
+const DAILY_LIMIT = parseInt(process.env.DAILY_LIMIT || "20", 10);
+
+// (Optionnel) minuit "local" pour le Retry-After
+const TZ_OFFSET_MIN = parseInt(process.env.TZ_OFFSET_MIN || "0", 10);
+
+function todayKeyUTC() {
+  const now = new Date();
+  const y = now.getUTCFullYear();
+  const m = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(now.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function secondsUntilNextMidnightUTC() {
+  const now = new Date();
+  const next = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() + 1, 0, 0, 0
+  ));
+  return Math.max(1, Math.ceil((next - now) / 1000));
+}
+
+function secondsUntilNextMidnightLocalOffset() {
+  if (TZ_OFFSET_MIN === 0) return secondsUntilNextMidnightUTC();
+  const now = new Date();
+  const localMs = now.getTime() + TZ_OFFSET_MIN * 60 * 1000;
+  const local = new Date(localMs);
+  const nextLocalMidnight =
+    Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() + 1, 0, 0, 0)
+    - TZ_OFFSET_MIN * 60 * 1000;
+  return Math.max(1, Math.ceil((nextLocalMidnight - now.getTime()) / 1000));
+}
+
+function checkDailyLimit(userId) {
+  const key = String(userId);
+  const day = todayKeyUTC();
+  const entry = DAILY.get(key);
+  if (!entry || entry.day !== day) {
+    DAILY.set(key, { day, count: 0 });
+  }
+  const e = DAILY.get(key);
+  if (e.count >= DAILY_LIMIT) {
+    return { ok: false, retryAfter: secondsUntilNextMidnightLocalOffset() };
+  }
+  e.count += 1;
+  return { ok: true };
+}
+
+// ========== Helpers OpenAI (Responses API) ==========
 async function callOpenAI(payload, apiKey) {
   const r = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -26,9 +79,10 @@ function pickMessage(body) {
 }
 
 function normalizeConvId(conv_id, user_id) {
-  if (!conv_id || typeof conv_id !== "string" || conv_id.trim() === "" || conv_id === "null")
+  // L'API exige un id commençant par "conv" et limité aux [A-Za-z0-9_-]
+  if (!conv_id || typeof conv_id !== "string" || !conv_id.trim() || conv_id === "null") {
     return `conv_${String(user_id || "user").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40)}`;
-  // si ça ne commence pas par conv, on le reformate proprement
+  }
   if (!conv_id.startsWith("conv")) {
     const clean = conv_id.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 50);
     return `conv_${clean}`;
@@ -46,65 +100,67 @@ function extractConvId(data, payload) {
   );
 }
 
+// ========== Handler ==========
 export default async function handler(req, res) {
   try {
-    if (req.method !== "POST")
-      return res.status(405).json({ error: "Method not allowed" });
+    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
     const { user_id, session, conv_id } = req.body || {};
     const msg = pickMessage(req.body);
 
     if (!user_id || !msg) {
       return res.status(400).json({
-        reply:
-          "Ton message semble vide. Dis-moi ce que tu veux savoir et je t’aide 🙂",
+        reply: "Ton message semble vide. Dis-moi ce que tu veux savoir et je t’aide 🙂",
+      });
+    }
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ reply: "Config manquante: OPENAI_API_KEY" });
+    }
+    if (!process.env.UNIBOT_ASSISTANT_ID) {
+      return res.status(500).json({ reply: "Config manquante: UNIBOT_ASSISTANT_ID" });
+    }
+
+    // ---- Daily rate-limit par utilisateur ----
+    const rl = checkDailyLimit(user_id);
+    if (!rl.ok) {
+      res.setHeader("Retry-After", rl.retryAfter.toString());
+      return res.status(429).json({
+        reply: `Tu as atteint la limite de ${DAILY_LIMIT} questions pour aujourd’hui. Réessaie dans ${rl.retryAfter}s 🙏`,
       });
     }
 
-    if (!process.env.OPENAI_API_KEY) {
-      return res
-        .status(500)
-        .json({ reply: "Config manquante: OPENAI_API_KEY" });
-    }
-
-    const systemPrompt =
-      "Tu es UNIBOT, assistant francophone clair et concret. " +
-      "Ne redis pas 'Salut' si la conversation est entamée. " +
-      "Réponds directement, en moins de 800 caractères si possible.";
-
-    // ✅ on génère toujours un conv_id valide
+    // ---- Conversation ID (mémoire) ----
     const conversation = normalizeConvId(conv_id, user_id);
 
+    // ---- Payload Responses API avec assistant_id ----
     const base = {
-      model: "gpt-4o-mini",
+      assistant_id: process.env.UNIBOT_ASSISTANT_ID,
       store: true,
-      conversation, // garanti valide
+      conversation, // "conv_..." — persiste le contexte
       input: [
-        { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
         { role: "user", content: [{ type: "input_text", text: msg }] },
       ],
     };
 
+    // 1er appel
     let { ok, status, text } = await callOpenAI(base, process.env.OPENAI_API_KEY);
 
+    // Si l'ID de conversation fourni n'existe pas → réessaie sans 'conversation' (création auto)
     if (!ok && status === 404) {
-      // recrée une conv propre
       const retry = { ...base };
       delete retry.conversation;
-      ({ ok, status, text } = await callOpenAI(
-        retry,
-        process.env.OPENAI_API_KEY
-      ));
+      ({ ok, status, text } = await callOpenAI(retry, process.env.OPENAI_API_KEY));
     }
 
     if (!ok) {
       let hint = "Erreur API OpenAI";
-      try {
-        hint = JSON.parse(text)?.error?.message || hint;
-      } catch {}
-      return res.status(500).json({
-        reply: `Erreur OpenAI (${status}) : ${hint}`,
-      });
+      try { hint = JSON.parse(text)?.error?.message || hint; } catch {}
+      if (status === 429) {
+        return res.status(429).json({
+          reply: "Beaucoup de demandes en ce moment 😅 Réessaie dans une minute.",
+        });
+      }
+      return res.status(500).json({ reply: `Erreur OpenAI (${status}) : ${hint}` });
     }
 
     const data = JSON.parse(text);
@@ -114,13 +170,13 @@ export default async function handler(req, res) {
       "Désolé, je n’ai pas pu répondre cette fois.";
 
     const newConv = extractConvId(data, base);
+
     return res.status(200).json({
       reply,
       conv_id: newConv || conversation,
       session: session || null,
     });
   } catch (e) {
-    console.error(e);
     return res.status(500).json({ reply: "Oups, une erreur est survenue." });
   }
 }
