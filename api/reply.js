@@ -1,13 +1,17 @@
 // api/reply.js
 
-// ========== Daily rate-limit (par utilisateur) ==========
-// Compteur en mémoire (reset à minuit UTC)
+// ====== Config & limites ======
 const DAILY = new Map(); // user_id -> { day: 'YYYY-MM-DD', count: number }
+const LAST_SEEN = new Map(); // user_id -> timestamp
+
 const DAILY_LIMIT = parseInt(process.env.DAILY_LIMIT || "20", 10);
-
-// (Optionnel) minuit "local" pour le Retry-After
 const TZ_OFFSET_MIN = parseInt(process.env.TZ_OFFSET_MIN || "0", 10);
+const IDLE_RESET_MIN = parseInt(process.env.IDLE_RESET_MIN || "30", 10);
 
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // fallback si pas d'assistant
+const HAS_ASSISTANT = !!process.env.UNIBOT_ASSISTANT_ID;
+
+// ====== Utilitaires temps ======
 function todayKeyUTC() {
   const now = new Date();
   const y = now.getUTCFullYear();
@@ -15,7 +19,6 @@ function todayKeyUTC() {
   const d = String(now.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
 }
-
 function secondsUntilNextMidnightUTC() {
   const now = new Date();
   const next = new Date(Date.UTC(
@@ -25,7 +28,6 @@ function secondsUntilNextMidnightUTC() {
   ));
   return Math.max(1, Math.ceil((next - now) / 1000));
 }
-
 function secondsUntilNextMidnightLocalOffset() {
   if (TZ_OFFSET_MIN === 0) return secondsUntilNextMidnightUTC();
   const now = new Date();
@@ -37,6 +39,7 @@ function secondsUntilNextMidnightLocalOffset() {
   return Math.max(1, Math.ceil((nextLocalMidnight - now.getTime()) / 1000));
 }
 
+// ====== Rate limit quotidien ======
 function checkDailyLimit(userId) {
   const key = String(userId);
   const day = todayKeyUTC();
@@ -52,12 +55,20 @@ function checkDailyLimit(userId) {
   return { ok: true };
 }
 
-// ========== Helpers OpenAI (Responses API) ==========
-async function callOpenAI(payload, apiKey) {
+// ====== Inactivité / reset auto ======
+function idleTooLong(userId, minutes = IDLE_RESET_MIN) {
+  const now = Date.now();
+  const last = LAST_SEEN.get(userId) || 0;
+  LAST_SEEN.set(userId, now);
+  return minutes > 0 && (now - last) > minutes * 60 * 1000;
+}
+
+// ====== OpenAI Responses API ======
+async function callOpenAI(payload) {
   const r = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
@@ -66,20 +77,21 @@ async function callOpenAI(payload, apiKey) {
   return { ok: r.ok, status: r.status, text };
 }
 
+// ====== Helpers texte / conversation ======
 function pickMessage(body) {
   const {
     message,
     user_text,
     "last user freeform": lastFreeform1,
     last_user_freeform: lastFreeform2,
+    "last user freeform input": lastFreeform3,
   } = body || {};
-  return (message ?? user_text ?? lastFreeform1 ?? lastFreeform2 ?? "")
+  return (message ?? user_text ?? lastFreeform1 ?? lastFreeform2 ?? lastFreeform3 ?? "")
     .toString()
+    .replace(/\s+/g, " ")
     .trim();
 }
-
 function normalizeConvId(conv_id, user_id) {
-  // L'API exige un id commençant par "conv" et limité aux [A-Za-z0-9_-]
   if (!conv_id || typeof conv_id !== "string" || !conv_id.trim() || conv_id === "null") {
     return `conv_${String(user_id || "user").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40)}`;
   }
@@ -89,7 +101,6 @@ function normalizeConvId(conv_id, user_id) {
   }
   return conv_id.slice(0, 64);
 }
-
 function extractConvId(data, payload) {
   return (
     data?.conversation?.id ||
@@ -99,8 +110,28 @@ function extractConvId(data, payload) {
     null
   );
 }
+function makeNewConvId(userId) {
+  const base = String(userId || "user").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40);
+  return `conv_${base}_${Date.now()}`;
+}
+function wantsReset(text) {
+  const t = (text || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[!?.,;:()\[\]{}"'`]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return (
+    t === "reset" ||
+    t === "/new" ||
+    t.includes("nouvelle question") ||
+    t.includes("autre sujet") ||
+    t.includes("changement de sujet") ||
+    t.startsWith("nouveau sujet")
+  );
+}
 
-// ========== Handler ==========
+// ====== Handler ======
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
@@ -116,11 +147,8 @@ export default async function handler(req, res) {
     if (!process.env.OPENAI_API_KEY) {
       return res.status(500).json({ reply: "Config manquante: OPENAI_API_KEY" });
     }
-    if (!process.env.UNIBOT_ASSISTANT_ID) {
-      return res.status(500).json({ reply: "Config manquante: UNIBOT_ASSISTANT_ID" });
-    }
 
-    // ---- Daily rate-limit par utilisateur ----
+    // ---- Rate limit par utilisateur
     const rl = checkDailyLimit(user_id);
     if (!rl.ok) {
       res.setHeader("Retry-After", rl.retryAfter.toString());
@@ -129,27 +157,33 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- Conversation ID (mémoire) ----
-    const conversation = normalizeConvId(conv_id, user_id);
+    // ---- Conversation & resets
+    let conversation = normalizeConvId(conv_id, user_id);
+    if (wantsReset(msg) || idleTooLong(user_id, IDLE_RESET_MIN)) {
+      conversation = makeNewConvId(user_id);
+    }
 
-    // ---- Payload Responses API avec assistant_id ----
+    // ---- Construire le payload Responses API
+    // On fournit TOUJOURS un identifiant valide :
+    //  - assistant_id si dispo
+    //  - SINON model (fallback)
     const base = {
-      assistant_id: process.env.UNIBOT_ASSISTANT_ID,
       store: true,
-      conversation, // "conv_..." — persiste le contexte
-      input: [
-        { role: "user", content: [{ type: "input_text", text: msg }] },
-      ],
+      conversation,
+      input: [{ role: "user", content: [{ type: "input_text", text: msg }] }],
+      ...(HAS_ASSISTANT
+        ? { assistant_id: process.env.UNIBOT_ASSISTANT_ID }
+        : { model: OPENAI_MODEL }),
     };
 
-    // 1er appel
-    let { ok, status, text } = await callOpenAI(base, process.env.OPENAI_API_KEY);
+    // 1) Appel principal
+    let { ok, status, text } = await callOpenAI(base);
 
-    // Si l'ID de conversation fourni n'existe pas → réessaie sans 'conversation' (création auto)
+    // 2) Si la conversation fournie n'existe pas (404), réessayer sans conversation pour en créer une
     if (!ok && status === 404) {
       const retry = { ...base };
       delete retry.conversation;
-      ({ ok, status, text } = await callOpenAI(retry, process.env.OPENAI_API_KEY));
+      ({ ok, status, text } = await callOpenAI(retry));
     }
 
     if (!ok) {
