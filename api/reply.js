@@ -1,93 +1,94 @@
-// api/reply.js — modèle direct, création auto de conversation
+// api/reply.js — Responses API avec previous_response_id
 
+// ------- Utils -------
+function pickMessage(body) {
+  const {
+    message,
+    user_text,
+    "last user freeform": f1,
+    last_user_freeform: f2,
+    "last user freeform input": f3,
+  } = body || {};
+  return (message ?? user_text ?? f1 ?? f2 ?? f3 ?? "").toString().trim();
+}
+function wantsReset(text) {
+  const t = (text || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[!?.,;:()"'`]+/g, "").trim();
+  return t === "reset" || t === "/new" || t.includes("nouvelle question") || t.includes("autre sujet");
+}
+
+async function callResponses(payload) {
+  const r = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  const txt = await r.text();
+  return { ok: r.ok, status: r.status, txt };
+}
+
+// ------- Handler -------
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
     const body = req.body || {};
     const user_id = String(body.user_id || "").trim();
-    const msg =
-      (body.message ??
-       body["last user freeform"] ??
-       body["last user freeform input"] ??
-       body.user_text ??
-       "").toString().trim();
+    const msg = pickMessage(body);
 
     if (!user_id || !msg) {
-      return res.status(400).json({ reply: "Message vide. Que puis-je faire pour toi ?" });
+      return res.status(400).json({ reply: "Ton message semble vide. Que puis-je faire pour toi ?" });
     }
     if (!process.env.OPENAI_API_KEY) {
       return res.status(500).json({ reply: "Config manquante: OPENAI_API_KEY" });
     }
 
-    // 1) Construire le payload de base (sans conversation)
-    const base = {
-      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-      store: true,
+    // ----- Construction du payload -----
+    const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+    // Si reset demandé, on repart sans previous_response_id
+    const previous = wantsReset(msg) ? null : (body.resp_id || null);
+
+    const payload = {
+      model,            // ✅ toujours présent (finit l'erreur "Missing model")
+      store: true,      // demande à OpenAI de persister la réponse pour pouvoir chaîner
+      ...(previous ? { previous_response_id: String(previous) } : {}),
       input: [
+        // Astuce : un mini system pour stabiliser le ton
         { role: "system", content: [{ type: "input_text", text: "Tu es Unibot. Réponds en français, clair et concis." }] },
-        { role: "user", content: [{ type: "input_text", text: msg }] }
-      ]
+        { role: "user", content: [{ type: "input_text", text: msg }] },
+      ],
     };
 
-    // 2) Si le client fournit un conv_id, on le normalise et on l'ajoute
-    const clientConv = (body.conv_id || "").toString().trim();
-    const hasClientConv = !!clientConv && clientConv.toLowerCase() !== "null";
-    const conversation = hasClientConv
-      ? (clientConv.startsWith("conv") ? clientConv.slice(0, 64)
-                                       : `conv_${clientConv}`.slice(0, 64))
-      : null;
-
-    const payload = hasClientConv ? { ...base, conversation } : { ...base };
-
-    // 3) Appel OpenAI
-    let r = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
-
-    // 4) Si 404 (conv inexistante), on réessaie sans conversation (création auto)
-    if (!r.ok && r.status === 404 && hasClientConv) {
-      const retryPayload = { ...base }; // sans conversation
-      r = await fetch("https://api.openai.com/v1/responses", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(retryPayload),
-      });
-    }
-
-    const raw = await r.text();
-    if (!r.ok) {
+    // ----- Appel API -----
+    let { ok, status, txt } = await callResponses(payload);
+    if (!ok) {
       let msgErr = "Erreur OpenAI";
-      try { msgErr = JSON.parse(raw)?.error?.message || msgErr; } catch {}
-      return res.status(500).json({ reply: `Erreur OpenAI (${r.status}) : ${msgErr}` });
+      try { msgErr = JSON.parse(txt)?.error?.message || msgErr; } catch {}
+      return res.status(500).json({ reply: `Erreur OpenAI (${status}) : ${msgErr}` });
     }
 
-    const data = JSON.parse(raw);
+    const data = JSON.parse(txt);
+
+    // ----- Extraction réponse + id pour chaîner -----
     const reply =
       data?.output?.[0]?.content?.[0]?.text ??
       data?.output_text ??
       "Désolé, je n’ai pas pu répondre cette fois.";
 
-    const newConvId =
-      data?.conversation?.id ||
-      data?.response?.conversation_id ||
-      data?.output?.[0]?.conversation_id ||
-      conversation || null;
+    // L’ID à réutiliser au tour suivant (chaînage Responses API)
+    const resp_id = data?.id || null;
 
     return res.status(200).json({
       reply,
-      conv_id: newConvId,
-      session: body.session || null,
+      resp_id,        // <= à stocker côté Chatfuel pour le prochain tour
+      // conv_id laissé de côté (inutile en Responses API si on chaîne par previous_response_id)
     });
   } catch (e) {
-    return res.status(500).json({ reply: "Oups, erreur serveur." });
+    return res.status(500).json({ reply: "Oups, une erreur est survenue." });
   }
 }
