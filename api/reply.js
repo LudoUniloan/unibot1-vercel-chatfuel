@@ -16,7 +16,6 @@ function wantsReset(text) {
     .toLowerCase().replace(/[!?.,;:()"'`]+/g,"").trim();
   return t === "reset" || t === "/new" || t.includes("nouvelle question") || t.includes("autre sujet");
 }
-
 async function call(payload) {
   const r = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -38,35 +37,29 @@ export default async function handler(req, res) {
     const user_id = String(body.user_id || "").trim();
     const msg = pickMessage(body);
 
-    if (!user_id || !msg) {
-      return res.status(400).json({ reply: "Ton message semble vide. Que puis-je faire pour toi ?" });
-    }
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ reply: "Config manquante: OPENAI_API_KEY" });
-    }
-    if (!process.env.UNIBOT_ASSISTANT_ID) {
-      return res.status(500).json({ reply: "Config manquante: UNIBOT_ASSISTANT_ID" });
-    }
+    if (!user_id || !msg) return res.status(400).json({ reply: "Ton message semble vide. Que puis-je faire pour toi ?" });
+    if (!process.env.OPENAI_API_KEY) return res.status(500).json({ reply: "Config manquante: OPENAI_API_KEY" });
+    if (!process.env.UNIBOT_ASSISTANT_ID) return res.status(500).json({ reply: "Config manquante: UNIBOT_ASSISTANT_ID" });
 
-    // --- Conversation : fixe par user (ou fournie par Chatfuel)
+    // Conversation fixe par user (reset si demandé)
     const rawConv = wantsReset(msg) ? "" : (body.conv_id || "");
     const conv_id = rawConv
       ? (rawConv.startsWith("conv") ? rawConv.slice(0, 64) : `conv_${rawConv}`.slice(0, 64))
       : `conv_${user_id}`.slice(0, 64);
 
-    const base = {
-      assistant_id: process.env.UNIBOT_ASSISTANT_ID,   // ✅ Assistant Unibot
+    const payload = {
+      assistant_id: process.env.UNIBOT_ASSISTANT_ID, // ✅ pas de "model" ici
       store: true,
-      conversation: conv_id,                          // ✅ même fil à chaque tour
+      conversation: conv_id,
       input: [{ role: "user", content: [{ type: "input_text", text: msg }] }],
     };
 
-    // 1) essai avec conversation fixe
-    let { ok, status, text } = await call(base);
+    // 1) essai avec conversation
+    let { ok, status, text } = await call(payload);
 
-    // 2) si 404 (conversation inconnue), on réessaie sans la forcer
+    // 2) si 404 sur la conversation, on réessaie sans la forcer
     if (!ok && status === 404) {
-      const retry = { ...base };
+      const retry = { ...payload };
       delete retry.conversation;
       ({ ok, status, text } = await call(retry));
     }
@@ -87,7 +80,6 @@ export default async function handler(req, res) {
       data?.output_text ??
       "Désolé, je n’ai pas pu répondre cette fois.";
 
-    // on privilégie la conversation renvoyée par l’API si dispo
     const apiConv =
       data?.conversation?.id ||
       data?.response?.conversation_id ||
