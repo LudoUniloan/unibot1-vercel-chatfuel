@@ -1,23 +1,21 @@
-// api/replyv2.js — Assistants v2 (runtime Node), robuste aux "null"/conv_id manquants
+// api/replyv2.js — Assistants v2 (runtime Node), version corrigée pour OPENAI_ASSISTANT_ID
 
-// --- Runtime en Node (pas Edge) ---
 export const config = { runtime: 'nodejs18.x' };
 
-// Env
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || process.env.OPENAI_KEY;
-const UNIBOT_ASSISTANT_ID = process.env.UNIBOT_ASSISTANT_ID;
+// === Variables d'environnement ===
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_ASSISTANT_ID = process.env.OPENAI_ASSISTANT_ID;  // <-- corrigé ici
 const DEBUG = String(process.env.DEBUG_LOGS || '').toLowerCase() === 'true';
 
-// Petits utilitaires
+// === Fonctions utilitaires ===
 function log(...a) { if (DEBUG) console.log('[replyv2]', ...a); }
 function j(res, status = 200) {
   return new Response(JSON.stringify(res), {
     status,
-    headers: { 'content-type': 'application/json' }
+    headers: { 'content-type': 'application/json' },
   });
 }
 
-// Nettoyages
 function sanitize(v) {
   if (v == null) return '';
   const t = String(v).trim();
@@ -47,7 +45,7 @@ function normalizeThreadId(raw) {
   return s.startsWith('thread_') ? s : '';
 }
 
-// Appel OpenAI v1 (Assistants v2)
+// === Appel OpenAI (Assistants v2) ===
 async function openai(path, init) {
   const url = `https://api.openai.com/v1/${path}`;
   const headers = {
@@ -60,7 +58,7 @@ async function openai(path, init) {
   if (!resp.ok) {
     throw new Error(`OpenAI ${resp.status}: ${text || resp.statusText}`);
   }
-  try { return JSON.parse(text); } catch (e) { return {}; }
+  try { return JSON.parse(text); } catch { return {}; }
 }
 
 async function ensureThreadId(incomingThreadId) {
@@ -71,7 +69,7 @@ async function ensureThreadId(incomingThreadId) {
 }
 
 async function postUserMessage(threadId, message) {
-  if (!message) return; // amorçage de thread sans message : ok
+  if (!message) return;
   await openai(`threads/${threadId}/messages`, {
     method: 'POST',
     body: JSON.stringify({ role: 'user', content: message }),
@@ -84,12 +82,11 @@ async function runAssistant(threadId, assistantId) {
     body: JSON.stringify({ assistant_id: assistantId }),
   });
 
-  // Polling simple
   for (let i = 0; i < 40; i++) {
     await new Promise(r => setTimeout(r, 800));
     const cur = await openai(`threads/${threadId}/runs/${run.id}`, { method: 'GET' });
     if (cur.status === 'completed' || cur.status === 'requires_action') return cur;
-    if (cur.status === 'failed' || cur.status === 'cancelled' || cur.status === 'expired') {
+    if (['failed', 'cancelled', 'expired'].includes(cur.status)) {
       throw new Error(`Run ended with status: ${cur.status}`);
     }
   }
@@ -108,24 +105,24 @@ async function getLastAssistantText(threadId) {
   return '';
 }
 
-// Handler
+// === Handler principal ===
 export default async function handler(req) {
   try {
-    if (req.method !== 'POST') {
-      return j({ reply: 'Not allowed' }, 405);
-    }
+    if (req.method !== 'POST') return j({ reply: 'Not allowed' }, 405);
 
-    if (!OPENAI_API_KEY || !UNIBOT_ASSISTANT_ID) {
-      log('Missing env', { hasKey: !!OPENAI_API_KEY, hasAssistant: !!UNIBOT_ASSISTANT_ID });
-      return j({ reply: 'Config manquante: OPENAI_API_KEY ou UNIBOT_ASSISTANT_ID', conv_id: null, version: 'assistant_v10' }, 500);
+    if (!OPENAI_API_KEY || !OPENAI_ASSISTANT_ID) {
+      log('Missing env', { hasKey: !!OPENAI_API_KEY, hasAssistant: !!OPENAI_ASSISTANT_ID });
+      return j({
+        reply: 'Config manquante: OPENAI_API_KEY ou OPENAI_ASSISTANT_ID',
+        conv_id: null,
+        version: 'assistant_v11'
+      }, 500);
     }
 
     let body = {};
     try {
-      // supporte header incorrect / payload texte
       const text = await req.text();
-      try { body = JSON.parse(text || '{}'); }
-      catch { body = {}; }
+      body = JSON.parse(text || '{}');
     } catch { body = {}; }
 
     const userId = sanitize(body.user_id || body.userId || body.uid);
@@ -134,24 +131,24 @@ export default async function handler(req) {
 
     log('input', { userId, message, convIdIn });
 
-    // 1) conv_id garanti
     const threadId = await ensureThreadId(convIdIn);
     log('thread', threadId);
 
-    // 2) message éventuel
     await postUserMessage(threadId, message);
-
-    // 3) run
-    const run = await runAssistant(threadId, UNIBOT_ASSISTANT_ID);
+    const run = await runAssistant(threadId, OPENAI_ASSISTANT_ID);
     log('runStatus', run.status);
 
-    // 4) réponse
     let reply = await getLastAssistantText(threadId);
     if (!reply) reply = "Je n’ai pas bien compris. Peux-tu reformuler en une phrase ?";
 
-    return j({ reply, conv_id: threadId, version: 'assistant_v10' });
+    return j({ reply, conv_id: threadId, version: 'assistant_v11' });
+
   } catch (err) {
     log('fatal', err?.stack || String(err));
-    return j({ reply: `Erreur: ${String(err?.message || err)}`, conv_id: null, version: 'assistant_v10' }, 500);
+    return j({
+      reply: `Erreur: ${String(err?.message || err)}`,
+      conv_id: null,
+      version: 'assistant_v11'
+    }, 500);
   }
 }
