@@ -1,154 +1,130 @@
-// api/replyv2.js — Assistants v2 (runtime Node), version corrigée pour OPENAI_ASSISTANT_ID
-
 export const config = { runtime: 'nodejs18.x' };
 
-// === Variables d'environnement ===
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_ASSISTANT_ID = process.env.OPENAI_ASSISTANT_ID;  // <-- corrigé ici
+const OPENAI_ASSISTANT_ID = process.env.OPENAI_ASSISTANT_ID;
 const DEBUG = String(process.env.DEBUG_LOGS || '').toLowerCase() === 'true';
 
-// === Fonctions utilitaires ===
-function log(...a) { if (DEBUG) console.log('[replyv2]', ...a); }
-function j(res, status = 200) {
-  return new Response(JSON.stringify(res), {
-    status,
-    headers: { 'content-type': 'application/json' },
-  });
+function log(tag, obj) { if (DEBUG) console.log(`[replyv2:${tag}]`, obj); }
+function resj(obj, status = 200) {
+  return new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } });
 }
 
-function sanitize(v) {
+function s(v) {
   if (v == null) return '';
   const t = String(v).trim();
-  if (!t) return '';
-  const low = t.toLowerCase();
-  if (low === 'null' || low === 'undefined') return '';
+  if (!t || t.toLowerCase() === 'null' || t.toLowerCase() === 'undefined') return '';
   return t;
 }
-
-function extractMessage(body) {
-  const cands = [
+function pickMessage(body) {
+  const c = [
     body.message,
     body.user_text,
     body['last user freeform'],
     body['last user freeform input'],
   ];
-  for (const c of cands) {
-    const s = sanitize(c);
-    if (s) return s;
+  for (const x of c) {
+    const y = s(x);
+    if (y) return y;
   }
   return '';
 }
-
-function normalizeThreadId(raw) {
-  const s = sanitize(raw);
-  if (!s) return '';
-  return s.startsWith('thread_') ? s : '';
+function normalizeThreadId(x) {
+  const t = s(x);
+  return t.startsWith('thread_') ? t : '';
 }
 
-// === Appel OpenAI (Assistants v2) ===
 async function openai(path, init) {
   const url = `https://api.openai.com/v1/${path}`;
   const headers = {
-    'Authorization': `Bearer ${OPENAI_API_KEY}`,
+    Authorization: `Bearer ${OPENAI_API_KEY}`,
     'Content-Type': 'application/json',
     'OpenAI-Beta': 'assistants=v2',
   };
-  const resp = await fetch(url, { ...init, headers: { ...headers, ...(init?.headers || {}) } });
-  const text = await resp.text().catch(() => '');
-  if (!resp.ok) {
-    throw new Error(`OpenAI ${resp.status}: ${text || resp.statusText}`);
+  const r = await fetch(url, { ...init, headers: { ...headers, ...(init?.headers || {}) } });
+  const txt = await r.text().catch(() => '');
+  if (!r.ok) {
+    // renvoie l’erreur brute d’OpenAI pour ne plus avoir de 500 silencieux
+    throw new Error(`OpenAI ${r.status}: ${txt || r.statusText}`);
   }
-  try { return JSON.parse(text); } catch { return {}; }
+  try { return JSON.parse(txt || '{}'); } catch { return {}; }
 }
 
-async function ensureThreadId(incomingThreadId) {
-  const valid = normalizeThreadId(incomingThreadId);
-  if (valid) return valid;
+async function ensureThread(idIn) {
+  const ok = normalizeThreadId(idIn);
+  if (ok) return ok;
   const t = await openai('threads', { method: 'POST', body: JSON.stringify({}) });
   return t.id;
 }
 
-async function postUserMessage(threadId, message) {
-  if (!message) return;
+async function postUserMsg(threadId, content) {
+  if (!content) return;
   await openai(`threads/${threadId}/messages`, {
     method: 'POST',
-    body: JSON.stringify({ role: 'user', content: message }),
+    body: JSON.stringify({ role: 'user', content }),
   });
 }
 
-async function runAssistant(threadId, assistantId) {
+async function runAssistant(threadId) {
   const run = await openai(`threads/${threadId}/runs`, {
     method: 'POST',
-    body: JSON.stringify({ assistant_id: assistantId }),
+    body: JSON.stringify({ assistant_id: OPENAI_ASSISTANT_ID }),
   });
-
   for (let i = 0; i < 40; i++) {
     await new Promise(r => setTimeout(r, 800));
     const cur = await openai(`threads/${threadId}/runs/${run.id}`, { method: 'GET' });
     if (cur.status === 'completed' || cur.status === 'requires_action') return cur;
     if (['failed', 'cancelled', 'expired'].includes(cur.status)) {
-      throw new Error(`Run ended with status: ${cur.status}`);
+      throw new Error(`Run status: ${cur.status}`);
     }
   }
   throw new Error('Run polling timeout');
 }
 
-async function getLastAssistantText(threadId) {
+async function lastAssistantText(threadId) {
   const data = await openai(`threads/${threadId}/messages?limit=10`, { method: 'GET' });
-  for (const msg of (data.data || [])) {
-    if (msg.role !== 'assistant') continue;
-    const parts = (msg.content || []).filter(p => p.type === 'text');
-    if (parts.length) {
-      return parts.map(p => p.text?.value || '').filter(Boolean).join('\n\n').trim();
-    }
+  for (const m of (data.data || [])) {
+    if (m.role !== 'assistant') continue;
+    const parts = (m.content || []).filter(p => p.type === 'text');
+    if (parts.length) return parts.map(p => p.text?.value || '').filter(Boolean).join('\n\n').trim();
   }
   return '';
 }
 
-// === Handler principal ===
 export default async function handler(req) {
   try {
-    if (req.method !== 'POST') return j({ reply: 'Not allowed' }, 405);
+    if (req.method !== 'POST') return resj({ reply: 'Not allowed' }, 405);
 
     if (!OPENAI_API_KEY || !OPENAI_ASSISTANT_ID) {
-      log('Missing env', { hasKey: !!OPENAI_API_KEY, hasAssistant: !!OPENAI_ASSISTANT_ID });
-      return j({
-        reply: 'Config manquante: OPENAI_API_KEY ou OPENAI_ASSISTANT_ID',
-        conv_id: null,
-        version: 'assistant_v11'
-      }, 500);
+      log('env-missing', { hasKey: !!OPENAI_API_KEY, hasAssistant: !!OPENAI_ASSISTANT_ID });
+      return resj({ reply: 'Config manquante: OPENAI_API_KEY ou OPENAI_ASSISTANT_ID', conv_id: null }, 500);
     }
 
+    // Lecture du body même si Chatfuel envoie un JSON vide
+    let raw = '';
+    try { raw = await req.text(); } catch {}
     let body = {};
-    try {
-      const text = await req.text();
-      body = JSON.parse(text || '{}');
-    } catch { body = {}; }
+    try { body = JSON.parse(raw || '{}'); } catch { body = {}; }
 
-    const userId = sanitize(body.user_id || body.userId || body.uid);
-    const message = extractMessage(body);
-    const convIdIn = sanitize(body.conv_id || body.thread_id || body.convId);
+    const userId = s(body.user_id || body.userId || body.uid);
+    const convIdIn = s(body.conv_id || body.thread_id || body.convId);
+    const message = pickMessage(body);
 
-    log('input', { userId, message, convIdIn });
+    log('input', { userId, convIdIn, message, raw });
 
-    const threadId = await ensureThreadId(convIdIn);
+    const threadId = await ensureThread(convIdIn);
     log('thread', threadId);
 
-    await postUserMessage(threadId, message);
-    const run = await runAssistant(threadId, OPENAI_ASSISTANT_ID);
-    log('runStatus', run.status);
+    await postUserMsg(threadId, message || ''); // message peut être vide au premier tour
+    const run = await runAssistant(threadId);
+    log('run', run.status);
 
-    let reply = await getLastAssistantText(threadId);
-    if (!reply) reply = "Je n’ai pas bien compris. Peux-tu reformuler en une phrase ?";
+    let reply = await lastAssistantText(threadId);
+    if (!reply) reply = "Je n’ai pas bien compris. Peux-tu reformuler ?";
 
-    return j({ reply, conv_id: threadId, version: 'assistant_v11' });
-
-  } catch (err) {
-    log('fatal', err?.stack || String(err));
-    return j({
-      reply: `Erreur: ${String(err?.message || err)}`,
-      conv_id: null,
-      version: 'assistant_v11'
-    }, 500);
+    return resj({ reply, conv_id: threadId, version: 'assistant_v11' });
+  } catch (e) {
+    log('fatal', e?.stack || String(e));
+    // NE PAS renvoyer 500 silencieux → renvoyer l’erreur lisible
+    return resj({ reply: `Erreur: ${String(e?.message || e)}`, conv_id: null, version: 'assistant_v11' }, 500);
   }
 }
