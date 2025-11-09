@@ -73,5 +73,11 @@ export default async function handler(req, res) {
     return res.status(200).json({ reply, conv_id: apiConv });
   } catch (e) {
     return res.status(500).json({ reply: `Oups : ${e.message}` });
+
+    return res.status(200).json({
+  reply,
+  conv_id: apiConv,
+  version: "assistant_v6" // <-- change ce tag à chaque push
+});
   }
 }
