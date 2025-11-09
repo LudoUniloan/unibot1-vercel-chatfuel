@@ -1,186 +1,172 @@
-// /api/replyv2.js
-// Mini backend Chatfuel → OpenAI Assistants v2
+// api/replyv2.js
+// Mini passerelle Chatfuel → OpenAI Responses API (assistants v2)
+// Requis en variables d'env : OPENAI_API_KEY, OPENAI_MODEL
+// Optionnel : DEBUG_LOGS ("1"), UNIBOT_ASSISTANT_ID, UNIBOT_KNOWLEDGE
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const ASSISTANT_ID   = process.env.OPENAI_ASSISTANT_ID;
+const MODEL          = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const DEBUG          = process.env.DEBUG_LOGS === '1';
+const UNIBOT_ASSISTANT_ID = process.env.UNIBOT_ASSISTANT_ID || '';
+const UNIBOT_KNOWLEDGE    = process.env.UNIBOT_KNOWLEDGE || '';
 
-const log = (stage, data) => {
-  if (!DEBUG) return;
-  try {
-    console.log(`[replyv2:${stage}] ${JSON.stringify(data)}`);
-  } catch {
-    console.log(`[replyv2:${stage}]`, data);
-  }
-};
+/* ------------------------------------------------------------------ */
+/* Helpers                                                            */
+/* ------------------------------------------------------------------ */
 
-// --- util: lecture body JSON robuste ---
-async function readBody(req) {
+function log(...args) {
+  if (DEBUG) console.log(...args);
+}
+
+async function readJson(req) {
   try {
-    if (req.body && typeof req.body === 'object') return req.body;
+    if (typeof req.body === 'object') return req.body;
     const txt = await new Promise((resolve, reject) => {
-      let raw = '';
-      req.on('data', (c) => (raw += c));
-      req.on('end', () => resolve(raw || '{}'));
+      let data = '';
+      req.on('data', c => (data += c));
+      req.on('end', () => resolve(data));
       req.on('error', reject);
     });
-    return JSON.parse(txt || '{}');
-  } catch {
+    return txt ? JSON.parse(txt) : {};
+  } catch (e) {
     return {};
   }
 }
 
-// --- util: création conversation conv_* ---
-async function createConversation() {
-  const r = await fetch('https://api.openai.com/v1/conversations', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
-      'OpenAI-Beta': 'assistants=v2',
-    },
-    body: JSON.stringify({}),
-  });
-  if (!r.ok) {
-    const t = await safeText(r);
-    throw new Error(`Create conv failed ${r.status}: ${t}`);
-  }
-  const j = await r.json();
-  // j.id = "conv_..."
-  return j.id;
+function pickMessage(body) {
+  // Chatfuel peut envoyer divers champs ; on priorise explicitement
+  const candidates = [
+    body.message,
+    body.user_text,
+    body['last user freeform'],
+    body['last user freeform input'],
+  ].filter(Boolean);
+
+  if (candidates.length === 0) return '';
+  return String(candidates[0]).trim();
 }
 
-// --- util: appel /v1/responses (Assistants v2) ---
-async function runAssistant({ conv_id, message }) {
-  const payload = {
-    assistant_id: ASSISTANT_ID,
-    conversation: conv_id,
+function normalizeConvId(raw) {
+  if (!raw) return '';
+  const s = String(raw).trim();
+  // OpenAI exige un id commençant par "conv_"
+  if (s.startsWith('conv_')) return s;
+  return '';
+}
+
+/* ------------------------------------------------------------------ */
+/* OpenAI Responses API v2                                            */
+/* ------------------------------------------------------------------ */
+
+async function askOpenAI({ message, convId }) {
+  // On construit un "system prompt" léger, + éventuelle mémo-knowledge
+  const SYSTEM_PROMPT = [
+    "Tu es Unibot, l’assistant WhatsApp d’Uniloan.",
+    "Réponds en français, clair et concis.",
+    "Si on te demande un prix ou une information produit, utilise les infos internes si présentes.",
+    UNIBOT_ASSISTANT_ID ? `assistant_id=${UNIBOT_ASSISTANT_ID}` : '',
+    UNIBOT_KNOWLEDGE ? `Mémo produits : ${UNIBOT_KNOWLEDGE}` : '',
+  ].filter(Boolean).join('\n');
+
+  const body = {
+    model: MODEL, // <-- OBLIGATOIRE
     input: [
-      {
-        role: 'user',
-        content: [{ type: 'text', text: message || '' }],
-      },
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user',   content: message },
     ],
   };
+
+  if (convId) body.conversation = convId;
+
+  log('[replyv2:openai_request]', { model: MODEL, hasConv: !!convId });
 
   const r = await fetch('https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'Authorization': `Bearer ${OPENAI_API_KEY}`,
       'Content-Type': 'application/json',
+      // indispensable pour v2
       'OpenAI-Beta': 'assistants=v2',
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
+
+  const json = await r.json();
 
   if (!r.ok) {
-    const t = await safeText(r);
-    throw new Error(`OpenAI ${r.status}: ${t}`);
+    const errMsg = `OpenAI ${r.status}: ${JSON.stringify(json, null, 2)}`;
+    throw new Error(errMsg);
   }
 
-  const j = await r.json();
-  // On récupère le premier bloc "output_text"
-  let reply = 'Oups, je n’ai pas compris.';
-  try {
-    // j.output est un tableau de "items" (messages, tool_outputs, etc.)
-    // Nous concaténons les segments textuels.
-    const texts = [];
-    if (Array.isArray(j.output)) {
-      for (const item of j.output) {
-        // item?.content: tableau de segments {type:'output_text', text: {value:''}}
-        if (Array.isArray(item?.content)) {
-          for (const seg of item.content) {
-            if (seg.type === 'output_text' && seg.text?.value) {
-              texts.push(seg.text.value);
-            }
-          }
-        }
-      }
-    }
-    if (texts.length) reply = texts.join('\n\n');
-  } catch (e) {
-    // garde le fallback
-  }
-  return reply;
+  // Texte de sortie
+  const reply =
+    json?.output?.[0]?.content?.[0]?.text?.value ??
+    json?.output_text ??
+    '';
+
+  const newConvId = json?.conversation || convId || null;
+
+  return { reply: reply || "Désolé, pas de réponse.", convId: newConvId };
 }
 
-async function safeText(r) {
-  try {
-    return await r.text();
-  } catch {
-    return '(no-body)';
-  }
-}
-
-function normalizeConvId(conv_id) {
-  if (typeof conv_id !== 'string' || !conv_id.trim()) return null;
-  const v = conv_id.trim();
-  if (!v.startsWith('conv_')) return null;
-  // OpenAI exige [a-zA-Z0-9_-] → conv_* respecte déjà
-  return v;
-}
+/* ------------------------------------------------------------------ */
+/* Vercel/Node handler                                                */
+/* ------------------------------------------------------------------ */
 
 export default async function handler(req, res) {
-  log('start', { method: req.method, url: req.url });
+  const start = Date.now();
+  try {
+    if (req.method !== 'POST') {
+      return res.status(405).json({ reply: 'Method Not Allowed' });
+    }
 
-  if (req.method !== 'POST') {
-    return res.status(405).json({ reply: 'Method Not Allowed' });
-  }
-  if (!OPENAI_API_KEY || !ASSISTANT_ID) {
-    return res
-      .status(500)
-      .json({ reply: 'Config manquante: OPENAI_API_KEY / OPENAI_ASSISTANT_ID' });
-  }
+    log('[replyv2:start]', { method: req.method, url: req.url });
 
-  const body = await readBody(req);
-  log('incoming', body);
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ reply: "Config manquante: OPENAI_API_KEY" });
+    }
+    if (!MODEL) {
+      return res.status(500).json({ reply: "Config manquante: OPENAI_MODEL" });
+    }
 
-  const user_id = (body.user_id || '').toString();
-  const message = (body.message || '').toString().trim();
-  let conv_id = normalizeConvId(body.conv_id);
+    const body = await readJson(req);
+    const userId = String(body.user_id || body.whatsapp_user_id || '').trim();
+    const convId = normalizeConvId(body.conv_id);
+    const message = pickMessage(body);
 
-  // Premier message: pas de conv_id → on crée
-  if (!conv_id) {
-    try {
-      conv_id = await createConversation();
-      log('created_conv', { conv_id });
-    } catch (e) {
-      log('error_create_conv', { error: String(e) });
-      return res.status(500).json({
-        reply: `Erreur: ${String(e).slice(0, 400)}`,
-        conv_id: null,
-        version: 'assistant_v10',
+    if (DEBUG) {
+      log('[replyv2:input]', {
+        userId,
+        message,
+        convId_in: body.conv_id || null,
+        convId_used: convId || null,
       });
     }
-  }
 
-  // Sécurité: message vide → courte invite
-  if (!message) {
+    if (!message) {
+      return res.status(200).json({
+        reply: "Il semble que votre message soit vide. Que puis-je faire pour vous aujourd'hui ?",
+        conv_id: convId || null,
+        version: 'assistant_v9',
+      });
+    }
+
+    // Appel OpenAI
+    const { reply, convId: finalConv } = await askOpenAI({ message, convId });
+
+    log('[replyv2:outgoing]', { ms: Date.now() - start, convId: finalConv });
+
     return res.status(200).json({
-      reply:
-        "Il semble que ton message soit vide. Peux-tu préciser ta question ?",
-      conv_id,
-      version: 'assistant_v10',
+      reply,
+      conv_id: finalConv || null,
+      version: 'assistant_v9',
+    });
+  } catch (err) {
+    const msg = String(err && err.message ? err.message : err);
+    log('[replyv2:openai_error]', { error: msg });
+    return res.status(200).json({
+      reply: `Erreur: ${msg}`,
+      conv_id: null,
+      version: 'assistant_v9',
     });
   }
-
-  // Appel OpenAI
-  let reply = 'Oups, une erreur est survenue.';
-  try {
-    reply = await runAssistant({ conv_id, message });
-  } catch (e) {
-    log('openai_error', { error: String(e) });
-    return res.status(200).json({
-      reply: `Erreur: ${String(e).slice(0, 400)}`,
-      conv_id,
-      version: 'assistant_v10',
-    });
-  }
-
-  log('outgoing', { reply: reply.slice(0, 200), conv_id });
-  return res.status(200).json({
-    reply,
-    conv_id,
-    version: 'assistant_v10',
-  });
 }
