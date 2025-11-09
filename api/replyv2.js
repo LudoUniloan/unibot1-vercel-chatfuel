@@ -140,6 +140,33 @@ export default async function handler(req, res) {
         convId_in: body.conv_id || null,
         convId_used: convId || null,
       });
+
+      function sanitizeField(v) {
+  if (v == null) return '';
+  const t = String(v).trim();
+  if (t === '' || t.toLowerCase() === 'null' || t.toLowerCase() === 'undefined') return '';
+  return t;
+}
+
+function pickMessage(body) {
+  const candidates = [
+    body.message,
+    body.user_text,
+    body['last user freeform'],
+    body['last user freeform input'],
+  ];
+  for (const c of candidates) {
+    const s = sanitizeField(c);
+    if (s) return s;
+  }
+  return '';
+}
+
+function normalizeConvId(raw) {
+  const s = sanitizeField(raw);
+  if (!s) return '';
+  return s.startsWith('conv_') ? s : '';
+}
     }
 
     if (!message) {
