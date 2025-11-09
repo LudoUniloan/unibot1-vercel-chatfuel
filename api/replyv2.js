@@ -1,154 +1,34 @@
-// api/replyv2.js
-// Mini passerelle Chatfuel → OpenAI Responses API (assistants v2)
-// Requis en variables d'env : OPENAI_API_KEY, OPENAI_MODEL
-// Optionnel : DEBUG_LOGS ("1"), UNIBOT_ASSISTANT_ID, UNIBOT_KNOWLEDGE
+// api/replyv2.js — Assistants v2, robuste aux "null"/conv_id manquants
+export const config = { runtime: 'edge' };
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const MODEL          = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const DEBUG          = process.env.DEBUG_LOGS === '1';
-const UNIBOT_ASSISTANT_ID = process.env.UNIBOT_ASSISTANT_ID || '';
-const UNIBOT_KNOWLEDGE    = process.env.UNIBOT_KNOWLEDGE || '';
-
-/* ------------------------------------------------------------------ */
-/* Helpers                                                            */
-/* ------------------------------------------------------------------ */
+const UNIBOT_ASSISTANT_ID = process.env.UNIBOT_ASSISTANT_ID;
+const DEBUG = String(process.env.DEBUG_LOGS || '').toLowerCase() === 'true';
 
 function log(...args) {
-  if (DEBUG) console.log(...args);
+  if (DEBUG) console.log('[replyv2]', ...args);
 }
 
-async function readJson(req) {
-  try {
-    if (typeof req.body === 'object') return req.body;
-    const txt = await new Promise((resolve, reject) => {
-      let data = '';
-      req.on('data', c => (data += c));
-      req.on('end', () => resolve(data));
-      req.on('error', reject);
-    });
-    return txt ? JSON.parse(txt) : {};
-  } catch (e) {
-    return {};
-  }
-}
-
-function pickMessage(body) {
-  // Chatfuel peut envoyer divers champs ; on priorise explicitement
-  const candidates = [
-    body.message,
-    body.user_text,
-    body['last user freeform'],
-    body['last user freeform input'],
-  ].filter(Boolean);
-
-  if (candidates.length === 0) return '';
-  return String(candidates[0]).trim();
-}
-
-function normalizeConvId(raw) {
-  if (!raw) return '';
-  const s = String(raw).trim();
-  // OpenAI exige un id commençant par "conv_"
-  if (s.startsWith('conv_')) return s;
-  return '';
-}
-
-/* ------------------------------------------------------------------ */
-/* OpenAI Responses API v2                                            */
-/* ------------------------------------------------------------------ */
-
-async function askOpenAI({ message, convId }) {
-  // On construit un "system prompt" léger, + éventuelle mémo-knowledge
-  const SYSTEM_PROMPT = [
-    "Tu es Unibot, l’assistant WhatsApp d’Uniloan.",
-    "Réponds en français, clair et concis.",
-    "Si on te demande un prix ou une information produit, utilise les infos internes si présentes.",
-    UNIBOT_ASSISTANT_ID ? `assistant_id=${UNIBOT_ASSISTANT_ID}` : '',
-    UNIBOT_KNOWLEDGE ? `Mémo produits : ${UNIBOT_KNOWLEDGE}` : '',
-  ].filter(Boolean).join('\n');
-
-  const body = {
-    model: MODEL, // <-- OBLIGATOIRE
-    input: [
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user',   content: message },
-    ],
-  };
-
-  if (convId) body.conversation = convId;
-
-  log('[replyv2:openai_request]', { model: MODEL, hasConv: !!convId });
-
-  const r = await fetch('https://api.openai.com/v1/responses', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
-      // indispensable pour v2
-      'OpenAI-Beta': 'assistants=v2',
-    },
-    body: JSON.stringify(body),
+function json(resObj, status = 200) {
+  return new Response(JSON.stringify(resObj), {
+    status,
+    headers: { 'content-type': 'application/json' },
   });
-
-  const json = await r.json();
-
-  if (!r.ok) {
-    const errMsg = `OpenAI ${r.status}: ${JSON.stringify(json, null, 2)}`;
-    throw new Error(errMsg);
-  }
-
-  // Texte de sortie
-  const reply =
-    json?.output?.[0]?.content?.[0]?.text?.value ??
-    json?.output_text ??
-    '';
-
-  const newConvId = json?.conversation || convId || null;
-
-  return { reply: reply || "Désolé, pas de réponse.", convId: newConvId };
 }
 
-/* ------------------------------------------------------------------ */
-/* Vercel/Node handler                                                */
-/* ------------------------------------------------------------------ */
+// -- Helpers ---------------------------------------------------------------
 
-export default async function handler(req, res) {
-  const start = Date.now();
-  try {
-    if (req.method !== 'POST') {
-      return res.status(405).json({ reply: 'Method Not Allowed' });
-    }
-
-    log('[replyv2:start]', { method: req.method, url: req.url });
-
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ reply: "Config manquante: OPENAI_API_KEY" });
-    }
-    if (!MODEL) {
-      return res.status(500).json({ reply: "Config manquante: OPENAI_MODEL" });
-    }
-
-    const body = await readJson(req);
-    const userId = String(body.user_id || body.whatsapp_user_id || '').trim();
-    const convId = normalizeConvId(body.conv_id);
-    const message = pickMessage(body);
-
-    if (DEBUG) {
-      log('[replyv2:input]', {
-        userId,
-        message,
-        convId_in: body.conv_id || null,
-        convId_used: convId || null,
-      });
-
-      function sanitizeField(v) {
+function sanitize(v) {
   if (v == null) return '';
   const t = String(v).trim();
-  if (t === '' || t.toLowerCase() === 'null' || t.toLowerCase() === 'undefined') return '';
+  if (!t) return '';
+  const low = t.toLowerCase();
+  if (low === 'null' || low === 'undefined') return '';
   return t;
 }
 
-function pickMessage(body) {
+function extractMessage(body) {
+  // On accepte plusieurs variantes venues de Chatfuel
   const candidates = [
     body.message,
     body.user_text,
@@ -156,44 +36,138 @@ function pickMessage(body) {
     body['last user freeform input'],
   ];
   for (const c of candidates) {
-    const s = sanitizeField(c);
+    const s = sanitize(c);
     if (s) return s;
   }
   return '';
 }
 
-function normalizeConvId(raw) {
-  const s = sanitizeField(raw);
+function normalizeThreadId(raw) {
+  const s = sanitize(raw);
   if (!s) return '';
-  return s.startsWith('conv_') ? s : '';
+  // Avec Assistants v2, les threads ressemblent à "thread_..."
+  return s.startsWith('thread_') ? s : '';
 }
+
+async function openai(path, init) {
+  const url = `https://api.openai.com/v1/${path}`;
+  const headers = {
+    'Authorization': `Bearer ${OPENAI_API_KEY}`,
+    'Content-Type': 'application/json',
+    // Obligatoire pour Assistants v2 :
+    'OpenAI-Beta': 'assistants=v2',
+  };
+  const resp = await fetch(url, { ...init, headers: { ...headers, ...(init?.headers || {}) } });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '');
+    throw new Error(`OpenAI ${resp.status}: ${txt || resp.statusText}`);
+  }
+  return resp.json();
+}
+
+// -- Core -----------------------------------------------------------------
+
+async function ensureThreadId(incomingThreadId) {
+  const valid = normalizeThreadId(incomingThreadId);
+  if (valid) return valid;
+  // Créer un nouveau thread si rien à réutiliser
+  const t = await openai('threads', { method: 'POST', body: JSON.stringify({}) });
+  return t.id; // "thread_..."
+}
+
+async function postUserMessage(threadId, message) {
+  if (!message) return; // on peut créer la conv sans message initial
+  await openai(`threads/${threadId}/messages`, {
+    method: 'POST',
+    body: JSON.stringify({ role: 'user', content: message }),
+  });
+}
+
+async function runAssistant(threadId, assistantId) {
+  const run = await openai(`threads/${threadId}/runs`, {
+    method: 'POST',
+    body: JSON.stringify({ assistant_id: assistantId }),
+  });
+
+  // Polling basique jusqu’à "completed" / "requires_action" / "failed"
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 900));
+    const r = await openai(`threads/${threadId}/runs/${run.id}`, { method: 'GET' });
+    if (r.status === 'completed' || r.status === 'requires_action') return r;
+    if (r.status === 'failed' || r.status === 'cancelled' || r.status === 'expired') {
+      throw new Error(`Run ended with status: ${r.status}`);
+    }
+  }
+  throw new Error('Run polling timeout');
+}
+
+async function getLastAssistantText(threadId) {
+  const data = await openai(`threads/${threadId}/messages?limit=10`, { method: 'GET' });
+  // Parcourt du plus récent au plus ancien
+  for (const msg of (data.data || [])) {
+    if (msg.role !== 'assistant') continue;
+    const parts = (msg.content || []).filter(p => p.type === 'text');
+    if (parts.length) {
+      return parts.map(p => p.text?.value || '').filter(Boolean).join('\n\n').trim();
+    }
+  }
+  return '';
+}
+
+// -- Handler --------------------------------------------------------------
+
+export default async function handler(req) {
+  try {
+    if (req.method !== 'POST') {
+      return json({ reply: 'Not allowed' }, 405);
     }
 
-    if (!message) {
-      return res.status(200).json({
-        reply: "Il semble que votre message soit vide. Que puis-je faire pour vous aujourd'hui ?",
-        conv_id: convId || null,
-        version: 'assistant_v9',
-      });
+    if (!OPENAI_API_KEY || !UNIBOT_ASSISTANT_ID) {
+      return json({ reply: 'Config manquante: OPENAI_API_KEY ou UNIBOT_ASSISTANT_ID' }, 500);
     }
 
-    // Appel OpenAI
-    const { reply, convId: finalConv } = await askOpenAI({ message, convId });
+    let body;
+    try {
+      body = await req.json();
+    } catch {
+      body = {};
+    }
 
-    log('[replyv2:outgoing]', { ms: Date.now() - start, convId: finalConv });
+    const userId = sanitize(body.user_id);
+    const message = extractMessage(body);
+    const convIdIn = sanitize(body.conv_id);
 
-    return res.status(200).json({
+    log(':input', { userId, message, convId_in: convIdIn });
+
+    // 1) Toujours garantir un thread_id (conv_id)
+    const threadId = await ensureThreadId(convIdIn);
+    log(':thread', threadId);
+
+    // 2) Poster le message seulement s’il y en a un
+    await postUserMessage(threadId, message);
+
+    // 3) Lancer le run
+    const run = await runAssistant(threadId, UNIBOT_ASSISTANT_ID);
+    log(':run', run.status);
+
+    // 4) Récupérer la réponse
+    let reply = await getLastAssistantText(threadId);
+    if (!reply) {
+      // filet de sécurité
+      reply = "Je n’ai pas bien compris. Peux-tu reformuler en une phrase ?";
+    }
+
+    return json({
       reply,
-      conv_id: finalConv || null,
-      version: 'assistant_v9',
+      conv_id: threadId,      // <- TOUJOURS renvoyé
+      version: 'assistant_v10'
     });
   } catch (err) {
-    const msg = String(err && err.message ? err.message : err);
-    log('[replyv2:openai_error]', { error: msg });
-    return res.status(200).json({
-      reply: `Erreur: ${msg}`,
+    log(':error', String(err?.message || err));
+    return json({
+      reply: `Erreur: ${String(err?.message || err)}`,
       conv_id: null,
-      version: 'assistant_v9',
-    });
+      version: 'assistant_v10'
+    }, 500);
   }
 }
