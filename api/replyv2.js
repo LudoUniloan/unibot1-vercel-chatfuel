@@ -1,8 +1,8 @@
-// /api/reply_assistant.js
-// Requiert sur Vercel :
-//   - OPENAI_API_KEY       (clé API OpenAI)
-//   - UNIBOT_ASSISTANT_ID  (id de l'assistant : asst_...)
-// Utilisation : POST JSON { user_id, message, conv_id? }
+// /api/replyv2.js
+// Vars requises (Vercel):
+//  - OPENAI_API_KEY
+//  - UNIBOT_ASSISTANT_ID  (format asst_...)
+// Route: POST JSON { user_id, message, conv_id? }
 
 const BASE = "https://api.openai.com/v1";
 
@@ -20,14 +20,11 @@ async function callOpenAI(path, body) {
     headers: {
       "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
       "Content-Type": "application/json",
-      // 👇 obligatoire pour l'Assistants API v2
-      "OpenAI-Beta": "assistants=v2",
+      "OpenAI-Beta": "assistants=v2", // requis pour v2
     },
     body: JSON.stringify(body)
   });
-
   if (!r.ok) {
-    // on remonte le message d'erreur OpenAI pour debug
     const txt = await r.text();
     throw new Error(`OpenAI ${r.status}: ${txt}`);
   }
@@ -35,13 +32,12 @@ async function callOpenAI(path, body) {
 }
 
 function pickAssistantText(msg) {
-  // v2 : content = [{ type: 'output_text', 'text' : {...} }, ...]
-  // on gère aussi les fallback possibles
+  // Assistants v2: content items -> type 'text' avec text.value
   const parts = Array.isArray(msg?.content) ? msg.content : [];
   const chunks = parts.map(p => {
-    if (p.type === "output_text" && p.output_text) return asString(p.output_text);
-    if (p.type === "text" && p.text?.value)    return asString(p.text.value);
-    if (typeof p.text === "string")            return p.text;
+    if (p.type === "text" && p.text?.value) return asString(p.text.value);
+    if (p.type === "output_text" && p.output_text) return asString(p.output_text); // tolérance
+    if (typeof p.text === "string") return p.text;
     return "";
   }).filter(Boolean);
   return chunks.join("\n").trim();
@@ -56,36 +52,33 @@ export default async function handler(req, res) {
     const { user_id, message, conv_id } = await readBody(req);
 
     if (!user_id) {
-      return res.status(400).json({ reply: "Paramètre user_id manquant.", conv_id: null, version: "assistant_v8" });
+      return res.status(400).json({ reply: "Paramètre user_id manquant.", conv_id: null, version: "assistant_v9" });
     }
     if (!message || !asString(message).trim()) {
-      return res.status(200).json({ reply: "Votre message est vide.", conv_id: conv_id || null, version: "assistant_v8" });
+      return res.status(200).json({ reply: "Votre message est vide.", conv_id: conv_id || null, version: "assistant_v9" });
     }
     if (!process.env.OPENAI_API_KEY || !process.env.UNIBOT_ASSISTANT_ID) {
-      return res.status(200).json({ reply: "Configuration manquante (OPENAI_API_KEY / UNIBOT_ASSISTANT_ID).", conv_id: null, version: "assistant_v8" });
+      return res.status(200).json({ reply: "Configuration manquante (OPENAI_API_KEY / UNIBOT_ASSISTANT_ID).", conv_id: null, version: "assistant_v9" });
     }
 
-    // conv_id déterministe (utile pour Chatfuel, même si l'Assistants API ne persiste pas encore entre runs sans stocker thread_id)
-    const apiConv = (conv_id && /^conv_[A-Za-z0-9_-]+$/.test(conv_id))
-      ? conv_id
-      : `conv_${user_id}`;
+    // conv_id déterministe pour Chatfuel (même si on ne persiste pas encore thread_id)
+    const apiConv = (conv_id && /^conv_[A-Za-z0-9_-]+$/.test(conv_id)) ? conv_id : `conv_${user_id}`;
 
-    // 1) Créer un thread éphémère (si tu veux la vraie mémoire, il faudra persister thread.id côté BDD)
+    // 1) Créer un thread (éphémère). Pour une vraie mémoire, stocke thread.id côté BDD par conv_id.
     const thread = await callOpenAI("/threads", {});
 
-    // 2) Ajouter le message utilisateur
+    // 2) Ajouter le message utilisateur — ⚠️ type = "text" en v2
     await callOpenAI(`/threads/${thread.id}/messages`, {
       role: "user",
-      content: [{ type: "input_text", text: asString(message) }]
+      content: [{ type: "text", text: asString(message) }]
     });
 
     // 3) Lancer un run avec ton assistant
     const run = await callOpenAI(`/threads/${thread.id}/runs`, {
       assistant_id: process.env.UNIBOT_ASSISTANT_ID
-      // (les outils / files / instructions sont déjà configurés côté Assistant)
     });
 
-    // 4) Polling jusqu'à completion (timeout ~ 24s max)
+    // 4) Polling (max ~24s)
     let replyText = null;
     for (let i = 0; i < 40; i++) {
       const rr = await fetch(`${BASE}/threads/${thread.id}/runs/${run.id}`, {
@@ -97,7 +90,7 @@ export default async function handler(req, res) {
       const data = await rr.json();
 
       if (data.status === "completed") {
-        // 5) Récupérer les messages (le dernier assistant en tête de liste)
+        // 5) Récupérer les messages du thread, prendre la dernière réponse assistant
         const msgs = await fetch(`${BASE}/threads/${thread.id}/messages?limit=10`, {
           headers: {
             "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -123,14 +116,14 @@ export default async function handler(req, res) {
     return res.status(200).json({
       reply: replyText,
       conv_id: apiConv,
-      version: "assistant_v8"
+      version: "assistant_v9"
     });
 
   } catch (e) {
     return res.status(200).json({
       reply: `Erreur: ${e.message || e}`,
       conv_id: null,
-      version: "assistant_v8"
+      version: "assistant_v9"
     });
   }
 }
